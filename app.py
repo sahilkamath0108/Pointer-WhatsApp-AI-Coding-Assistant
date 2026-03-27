@@ -39,28 +39,59 @@ def ensure_user_session(user_id):
             "chat_history": []
         }
 
+def _twilio_form_get(request, key: str, default: str = "") -> str:
+    """
+    Twilio sends inbound webhooks as application/x-www-form-urlencoded.
+    Prefer request.form (see Twilio Flask blog); fall back to request.values.
+    Empty string is valid (e.g. image with no caption) — use key in form, not truthiness.
+    """
+    if key in request.form:
+        v = request.form.get(key)
+        if v is None:
+            return default
+        return v.strip() if isinstance(v, str) else str(v)
+    v = request.values.get(key, default)
+    if v is None:
+        return default
+    return v.strip() if isinstance(v, str) else str(v)
+
+
 def _parse_twilio_media(request, twilio_service):
-    """Download WhatsApp media; returns list of {mime_type, data: bytes}."""
+    """
+    Download WhatsApp / MMS media from MediaUrl0, MediaUrl1, ...
+    Per Twilio docs, iterate URLs until MediaUrl{i} is missing — do not rely on NumMedia alone.
+    """
     out = []
     try:
-        n = int(request.values.get("NumMedia", 0) or 0)
+        num_media = int(_twilio_form_get(request, "NumMedia", "0") or "0")
     except (TypeError, ValueError):
-        n = 0
+        num_media = 0
+
     max_bytes = 5 * 1024 * 1024
-    max_items = 5
-    for i in range(min(n, max_items)):
-        url = request.values.get(f"MediaUrl{i}")
+    max_items = 10
+
+    for i in range(max_items):
+        url = _twilio_form_get(request, f"MediaUrl{i}", "")
         if not url:
-            continue
+            break
+        hint = _twilio_form_get(request, f"MediaContentType{i}", "") or None
         try:
-            data, mime = twilio_service.download_media(url)
+            data, mime = twilio_service.download_media(url, content_type_hint=hint)
         except Exception as e:
-            logger.warning(f"Failed to download media {i}: {e}")
+            logger.warning("Failed to download media %s: %s", i, e)
             continue
         if len(data) > max_bytes:
-            logger.warning(f"Skipping media {i}: size {len(data)} exceeds cap")
+            logger.warning("Skipping media %s: size %s exceeds cap", i, len(data))
             continue
         out.append({"mime_type": mime, "data": data})
+
+    if num_media and len(out) != num_media:
+        logger.warning(
+            "NumMedia=%s but downloaded %s file(s); check MediaUrl fields",
+            num_media,
+            len(out),
+        )
+
     return out
 
 def _retain_only_last_user_images(history):
@@ -126,16 +157,19 @@ def process_message_background(sender, incoming_msg, image_parts=None):
 def webhook():
     """WhatsApp webhook endpoint"""
     try:
-        incoming_msg = request.values.get('Body', '').strip()
-        sender = request.values.get('From', '')
+        incoming_msg = _twilio_form_get(request, "Body", "")
+        sender = _twilio_form_get(request, "From", "")
 
         image_parts = _parse_twilio_media(request, twilio_service)
-        
+
         preview = incoming_msg[:50] if incoming_msg else "(no text)"
         logger.info(
-            f"Received from {sender}: {preview}... "
-            f"media={len(image_parts)}"
+            "Webhook form keys sample: From/Body/NumMedia present | "
+            "NumMedia=%s | media downloaded=%s",
+            _twilio_form_get(request, "NumMedia", "?"),
+            len(image_parts),
         )
+        logger.info("Received from %s: %s... ", sender, preview)
         
         if not sender:
             logger.warning("Sender missing")
