@@ -1,6 +1,7 @@
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 import os
+import requests
 from utils.logger import logger
 
 class TwilioService:
@@ -26,9 +27,9 @@ class TwilioService:
         resp.message(message)
         return str(resp)
     
-    async def send_message(self, to, message):
+    def send_message(self, to, message):
         """
-        Send a WhatsApp message to a user
+        Send a WhatsApp message via REST API (for follow-ups after a fast webhook ack).
         """
         if not self.client:
             logger.error("Twilio client not initialized. Check your environment variables.")
@@ -37,14 +38,31 @@ class TwilioService:
         logger.info(f"Sending WhatsApp message to {to}")
         
         try:
-            message = self.client.messages.create(
+            msg = self.client.messages.create(
                 from_=self.phone_number,
                 body=message,
                 to=to
             )
             
-            logger.info(f"Message sent successfully, SID: {message.sid}")
-            return message.sid
+            logger.info(f"Message sent successfully, SID: {msg.sid}")
+            return msg.sid
         except Exception as e:
             logger.error(f"Failed to send message: {str(e)}")
-            raise 
+            raise
+
+    def download_media(self, url: str) -> tuple[bytes, str]:
+        """
+        Fetch media from Twilio's MediaUrl (HTTP Basic auth with Account SID / Auth Token).
+        Returns (bytes, mime_type).
+        """
+        if not self.account_sid or not self.auth_token:
+            raise ValueError("Twilio credentials required to download media")
+        logger.info("Downloading media from Twilio URL")
+        r = requests.get(
+            url,
+            auth=(self.account_sid, self.auth_token),
+            timeout=45,
+        )
+        r.raise_for_status()
+        ct = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
+        return r.content, ct

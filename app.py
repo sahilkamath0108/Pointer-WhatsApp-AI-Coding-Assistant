@@ -1,8 +1,11 @@
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 import os
+import base64
+import threading
 from services.twilio_service import TwilioService
 from services.ai_service import GeminiService
+from services.mcp_manager import MCPManager
 from utils.logger import logger
 import secrets
 
@@ -14,7 +17,9 @@ app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(16))
 # Initialize services
 try:
     twilio_service = TwilioService()
-    gemini_service = GeminiService()
+    mcp_manager = MCPManager()
+    mcp_manager.start()
+    gemini_service = GeminiService(mcp_manager)
     logger.info("Services initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing services: {str(e)}")
@@ -34,48 +39,135 @@ def ensure_user_session(user_id):
             "chat_history": []
         }
 
+def _parse_twilio_media(request, twilio_service):
+    """Download WhatsApp media; returns list of {mime_type, data: bytes}."""
+    out = []
+    try:
+        n = int(request.values.get("NumMedia", 0) or 0)
+    except (TypeError, ValueError):
+        n = 0
+    max_bytes = 5 * 1024 * 1024
+    max_items = 5
+    for i in range(min(n, max_items)):
+        url = request.values.get(f"MediaUrl{i}")
+        if not url:
+            continue
+        try:
+            data, mime = twilio_service.download_media(url)
+        except Exception as e:
+            logger.warning(f"Failed to download media {i}: {e}")
+            continue
+        if len(data) > max_bytes:
+            logger.warning(f"Skipping media {i}: size {len(data)} exceeds cap")
+            continue
+        out.append({"mime_type": mime, "data": data})
+    return out
+
+def _retain_only_last_user_images(history):
+    """Drop image payloads from older user turns to limit memory and token use."""
+    last_user_idx = None
+    for i in range(len(history) - 1, -1, -1):
+        m = history[i]
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        return
+    for i, m in enumerate(history):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        if i == last_user_idx or not m.get("images_b64"):
+            continue
+        new_m = dict(m)
+        new_m.pop("images_b64", None)
+        c = new_m.get("content") or ""
+        if "[earlier image omitted]" not in c:
+            new_m["content"] = c + " [earlier image omitted]"
+        history[i] = new_m
+
+def process_message_background(sender, incoming_msg, image_parts=None):
+    """
+    Run Gemini + MCP after Twilio has received a fast webhook ack.
+    Sends the real reply via Twilio REST API.
+    """
+    try:
+        logger.info(f"[BG] AI processing for {sender}")
+        github_token = user_sessions[sender].get("github_token")
+        chat_history = user_sessions[sender].get("chat_history", [])
+
+        ai_response = gemini_service.generate_response(
+            incoming_msg,
+            github_token,
+            chat_history,
+            image_parts=image_parts or [],
+        )
+
+        user_sessions[sender]["chat_history"].append({
+            "role": "assistant",
+            "content": ai_response
+        })
+        _retain_only_last_user_images(user_sessions[sender]["chat_history"])
+        if len(user_sessions[sender]["chat_history"]) > 20:
+            user_sessions[sender]["chat_history"] = user_sessions[sender]["chat_history"][-20:]
+
+        logger.info(f"[BG] Response ready for {sender}, length: {len(ai_response)}")
+        twilio_service.send_message(sender, ai_response)
+    except Exception as e:
+        logger.error(f"[BG] Error processing message for {sender}: {str(e)}")
+        try:
+            twilio_service.send_message(
+                sender,
+                "Sorry, I hit an error while processing your message. Please try again.",
+            )
+        except Exception as send_err:
+            logger.error(f"[BG] Failed to send error notice: {str(send_err)}")
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """WhatsApp webhook endpoint"""
     try:
         incoming_msg = request.values.get('Body', '').strip()
         sender = request.values.get('From', '')
+
+        image_parts = _parse_twilio_media(request, twilio_service)
         
-        logger.info(f"Received message from {sender}: {incoming_msg[:50]}...")
+        preview = incoming_msg[:50] if incoming_msg else "(no text)"
+        logger.info(
+            f"Received from {sender}: {preview}... "
+            f"media={len(image_parts)}"
+        )
         
-        if not incoming_msg or not sender:
+        if not sender:
+            logger.warning("Sender missing")
+            return twilio_service.create_response("Error: sender missing.")
+        if not incoming_msg and not image_parts:
             logger.warning("Message or sender information missing")
             return twilio_service.create_response("Error: Message or sender information missing.")
         
         # Ensure user session exists
         ensure_user_session(sender)
-        
-        logger.info(f"Processing message from {sender}")
-        
-        # Add user message to chat history
-        user_sessions[sender]["chat_history"].append({
-            "role": "user",
-            "content": incoming_msg
-        })
-        
-        # Pass session info and chat history to AI service
-        github_token = user_sessions[sender].get("github_token")
-        chat_history = user_sessions[sender].get("chat_history", [])
-        
-        ai_response = gemini_service.generate_response(incoming_msg, github_token, chat_history)
-        
-        # Add AI response to chat history
-        user_sessions[sender]["chat_history"].append({
-            "role": "assistant",
-            "content": ai_response
-        })
-        
-        # Keep chat history manageable (limit to last 20 messages)
-        if len(user_sessions[sender]["chat_history"]) > 20:
-            user_sessions[sender]["chat_history"] = user_sessions[sender]["chat_history"][-20:]
-        
-        logger.info(f"Response generated, length: {len(ai_response)}")
-        return twilio_service.create_response(ai_response)
+
+        display_text = incoming_msg or "(sent image(s))"
+        user_entry = {"role": "user", "content": display_text}
+        if image_parts:
+            user_entry["images_b64"] = [
+                {
+                    "mime_type": p["mime_type"],
+                    "data_b64": base64.b64encode(p["data"]).decode("ascii"),
+                }
+                for p in image_parts
+            ]
+        user_sessions[sender]["chat_history"].append(user_entry)
+
+        threading.Thread(
+            target=process_message_background,
+            args=(sender, display_text, image_parts),
+            daemon=True,
+        ).start()
+
+        # Immediate TwiML so Twilio does not time out (~15s) while AI runs
+        ack = "Got your message — I'm working on it and will reply here in a moment."
+        return twilio_service.create_response(ack)
         
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
