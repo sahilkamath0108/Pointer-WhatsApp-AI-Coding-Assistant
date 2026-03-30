@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  web:
+    build: .
+    command: ["python", "serve_waitress.py"]
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      # Use docker redis service name
+      - REDIS_URL=redis://redis:6379/0
+      - USE_RQ=1
+      - BIND_HOST=0.0.0.0
+      - PORT=5000
+      # First-run npx installs can be slow in containers
+      - MCP_START_TIMEOUT=600
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "run_worker.py"]
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - USE_RQ=1
+      - MCP_START_TIMEOUT=600
+    depends_on:
+      redis:
+        condition: service_healthy
+

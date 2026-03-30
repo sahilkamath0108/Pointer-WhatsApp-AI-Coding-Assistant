@@ -5,3 +5,7 @@ google-generativeai
 requests
 mcp
 google-genai
+redis>=5.0.0
+rq>=1.16.0
+gunicorn>=22.0.0
+waitress>=3.0.0

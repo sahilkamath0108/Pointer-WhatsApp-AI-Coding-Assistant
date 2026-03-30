@@ -19,6 +19,7 @@ A simple WhatsApp bot powered by Google Gemini AI that helps users build apps an
 - Twilio account with WhatsApp sandbox
 - Google Gemini API key
 - (Optional) GitHub personal access token
+- (Optional) Redis (recommended for scalability)
 
 ### Installation
 
@@ -53,6 +54,39 @@ A simple WhatsApp bot powered by Google Gemini AI that helps users build apps an
    ```bash
    python app.py
    ```
+
+## Docker (recommended on Windows)
+
+This project uses MCP servers started via `npx`, and background processing via Redis + RQ.
+Running in Docker gives you a Linux environment even on Windows.
+
+### Prerequisites
+
+- Docker Desktop
+- Twilio + Gemini credentials in `.env`
+
+### Run
+
+1. Copy env file:
+
+```bash
+cp .env.example .env
+```
+
+2. Start web + worker + Redis:
+
+```bash
+docker compose up --build
+```
+
+- Web listens on `http://localhost:5000`
+- Set Twilio webhook to `https://<ngrok-domain>/webhook`
+- Use ngrok from your host: `ngrok http 5000`
+
+### Notes
+
+- First run can take a few minutes while `npx` downloads MCP packages.
+- For local dev without RQ, set `USE_RQ=0` to use threads.
 
 ## Usage
 

@@ -6,6 +6,9 @@ import threading
 from services.twilio_service import TwilioService
 from services.ai_service import GeminiService
 from services.mcp_manager import MCPManager
+from services.session_store import get_session_store
+from services import queue_service
+from utils.chat_history import retain_only_last_user_images
 from utils.logger import logger
 import secrets
 
@@ -20,24 +23,16 @@ try:
     mcp_manager = MCPManager()
     mcp_manager.start()
     gemini_service = GeminiService(mcp_manager)
+    session_store = get_session_store()
     logger.info("Services initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing services: {str(e)}")
     raise
 
-# Session management for user conversations
-user_sessions = {}
 
 def ensure_user_session(user_id):
-    """
-    Initialize user session if it doesn't exist (used by both WhatsApp and API endpoints)
-    GitHub token is always loaded from environment variables
-    """
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            "github_token": os.environ.get('GITHUB_TOKEN'),  # Load from env
-            "chat_history": []
-        }
+    """Ensure session row exists (Redis or memory)."""
+    session_store.ensure_session(user_id)
 
 def _twilio_form_get(request, key: str, default: str = "") -> str:
     """
@@ -94,28 +89,6 @@ def _parse_twilio_media(request, twilio_service):
 
     return out
 
-def _retain_only_last_user_images(history):
-    """Drop image payloads from older user turns to limit memory and token use."""
-    last_user_idx = None
-    for i in range(len(history) - 1, -1, -1):
-        m = history[i]
-        if isinstance(m, dict) and m.get("role") == "user":
-            last_user_idx = i
-            break
-    if last_user_idx is None:
-        return
-    for i, m in enumerate(history):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        if i == last_user_idx or not m.get("images_b64"):
-            continue
-        new_m = dict(m)
-        new_m.pop("images_b64", None)
-        c = new_m.get("content") or ""
-        if "[earlier image omitted]" not in c:
-            new_m["content"] = c + " [earlier image omitted]"
-        history[i] = new_m
-
 def process_message_background(sender, incoming_msg, image_parts=None):
     """
     Run Gemini + MCP after Twilio has received a fast webhook ack.
@@ -123,8 +96,9 @@ def process_message_background(sender, incoming_msg, image_parts=None):
     """
     try:
         logger.info(f"[BG] AI processing for {sender}")
-        github_token = user_sessions[sender].get("github_token")
-        chat_history = user_sessions[sender].get("chat_history", [])
+        sess = session_store.get_session(sender)
+        github_token = sess.get("github_token")
+        chat_history = sess.get("chat_history", [])
 
         ai_response = gemini_service.generate_response(
             incoming_msg,
@@ -133,13 +107,14 @@ def process_message_background(sender, incoming_msg, image_parts=None):
             image_parts=image_parts or [],
         )
 
-        user_sessions[sender]["chat_history"].append({
+        sess["chat_history"].append({
             "role": "assistant",
             "content": ai_response
         })
-        _retain_only_last_user_images(user_sessions[sender]["chat_history"])
-        if len(user_sessions[sender]["chat_history"]) > 20:
-            user_sessions[sender]["chat_history"] = user_sessions[sender]["chat_history"][-20:]
+        retain_only_last_user_images(sess["chat_history"])
+        if len(sess["chat_history"]) > 20:
+            sess["chat_history"] = sess["chat_history"][-20:]
+        session_store.save_session(sender, sess)
 
         logger.info(f"[BG] Response ready for {sender}, length: {len(ai_response)}")
         twilio_service.send_message(sender, ai_response)
@@ -177,8 +152,13 @@ def webhook():
         if not incoming_msg and not image_parts:
             logger.warning("Message or sender information missing")
             return twilio_service.create_response("Error: Message or sender information missing.")
-        
-        # Ensure user session exists
+
+        message_sid = _twilio_form_get(request, "MessageSid", "")
+        if not session_store.try_claim_twilio_message(message_sid):
+            logger.info("Duplicate Twilio webhook ignored MessageSid=%s", message_sid)
+            ack = "Got your message — I'm working on it and will reply here in a moment."
+            return twilio_service.create_response(ack)
+
         ensure_user_session(sender)
 
         display_text = incoming_msg or "(sent image(s))"
@@ -191,13 +171,20 @@ def webhook():
                 }
                 for p in image_parts
             ]
-        user_sessions[sender]["chat_history"].append(user_entry)
+        sess = session_store.get_session(sender)
+        sess["chat_history"].append(user_entry)
+        session_store.save_session(sender, sess)
 
-        threading.Thread(
-            target=process_message_background,
-            args=(sender, display_text, image_parts),
-            daemon=True,
-        ).start()
+        if queue_service.use_rq_worker():
+            queue_service.enqueue_whatsapp_job(
+                sender, display_text, image_parts, message_sid
+            )
+        else:
+            threading.Thread(
+                target=process_message_background,
+                args=(sender, display_text, image_parts),
+                daemon=True,
+            ).start()
 
         # Immediate TwiML so Twilio does not time out (~15s) while AI runs
         ack = "Got your message — I'm working on it and will reply here in a moment."
@@ -227,38 +214,30 @@ def api_chat():
         
         logger.info(f"API: Received message from {user_id}: {message[:50]}...")
         
-        # Ensure user session exists
         ensure_user_session(user_id)
-        
-        # Add user message to chat history
-        user_sessions[user_id]["chat_history"].append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Pass session info and chat history to AI service
-        github_token = user_sessions[user_id].get("github_token")
-        chat_history = user_sessions[user_id].get("chat_history", [])
-        
+
+        sess = session_store.get_session(user_id)
+        sess["chat_history"].append({"role": "user", "content": message})
+        session_store.save_session(user_id, sess)
+
+        github_token = sess.get("github_token")
+        chat_history = sess.get("chat_history", [])
+
         ai_response = gemini_service.generate_response(message, github_token, chat_history)
-        
-        # Add AI response to chat history
-        user_sessions[user_id]["chat_history"].append({
-            "role": "assistant",
-            "content": ai_response
-        })
-        
-        # Keep chat history manageable (limit to last 20 messages)
-        if len(user_sessions[user_id]["chat_history"]) > 20:
-            user_sessions[user_id]["chat_history"] = user_sessions[user_id]["chat_history"][-20:]
-        
+
+        sess = session_store.get_session(user_id)
+        sess["chat_history"].append({"role": "assistant", "content": ai_response})
+        if len(sess["chat_history"]) > 20:
+            sess["chat_history"] = sess["chat_history"][-20:]
+        session_store.save_session(user_id, sess)
+
         logger.info(f"API: Response generated, length: {len(ai_response)}")
-        
+
         return jsonify({
             "response": ai_response,
             "user_id": user_id,
             "message_type": "ai_response",
-            "chat_history_length": len(user_sessions[user_id]["chat_history"]),
+            "chat_history_length": len(sess["chat_history"]),
             "has_github_token": bool(github_token)
         })
         
@@ -270,13 +249,14 @@ def api_chat():
 def get_chat_history(user_id):
     """Get chat history for a specific user"""
     try:
-        if user_id not in user_sessions:
+        if not session_store.session_exists(user_id):
             return jsonify({"error": "User session not found"}), 404
-        
+
+        sess = session_store.get_session(user_id)
         return jsonify({
             "user_id": user_id,
-            "chat_history": user_sessions[user_id]["chat_history"],
-            "has_github_token": bool(user_sessions[user_id].get("github_token"))
+            "chat_history": sess["chat_history"],
+            "has_github_token": bool(sess.get("github_token"))
         })
     except Exception as e:
         logger.error(f"Error getting chat history: {str(e)}")
@@ -286,17 +266,16 @@ def get_chat_history(user_id):
 def clear_chat_history(user_id):
     """Clear chat history for a specific user"""
     try:
-        if user_id in user_sessions:
-            # Keep the GitHub token but clear chat history
-            github_token = user_sessions[user_id].get("github_token")
-            user_sessions[user_id] = {
-                "github_token": github_token,
-                "chat_history": []
-            }
+        if session_store.session_exists(user_id):
+            sess = session_store.get_session(user_id)
+            github_token = sess.get("github_token")
+            session_store.save_session(
+                user_id,
+                {"github_token": github_token, "chat_history": []},
+            )
             logger.info(f"Chat history cleared for {user_id}")
             return jsonify({"message": "Chat history cleared", "user_id": user_id})
-        else:
-            return jsonify({"error": "User session not found"}), 404
+        return jsonify({"error": "User session not found"}), 404
     except Exception as e:
         logger.error(f"Error clearing chat history: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
@@ -305,12 +284,15 @@ def clear_chat_history(user_id):
 def health_check():
     """Health check endpoint"""
     try:
+        store_ok = session_store.ping()
         return jsonify({
-            "status": "healthy", 
+            "status": "healthy" if store_ok else "degraded",
             "service": "waWeb",
             "services": {
                 "twilio": "initialized",
-                "gemini": "initialized"
+                "gemini": "initialized",
+                "session_store": "ok" if store_ok else "unavailable",
+                "rq_worker": "enabled" if queue_service.use_rq_worker() else "disabled",
             }
         })
     except Exception as e:
