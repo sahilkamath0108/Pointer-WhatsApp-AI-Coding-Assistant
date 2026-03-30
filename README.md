@@ -1,25 +1,28 @@
 # Pointer - WhatsApp AI Coding Assistant
 
-A simple WhatsApp bot powered by Google Gemini AI that helps users build apps and websites through conversational coding assistance.
+A WhatsApp-first AI coding assistant powered by Google Gemini. It receives messages (and images) via Twilio webhooks, acknowledges immediately (to avoid Twilio timeouts), then generates the final response in the background and sends it via Twilio REST.
 
 ## Features
 
-- 🤖 **AI-Powered Coding Help**: Get coding assistance through WhatsApp using Google Gemini AI
-- 💬 **WhatsApp Integration**: Seamless interaction through Twilio WhatsApp API
-- 🔗 **GitHub Token Support**: Store GitHub personal access tokens for enhanced project guidance
-- 📚 **Chat History**: Maintains conversation context for better assistance
-- 🌐 **REST API**: Test the AI assistant without WhatsApp using the HTTP API
-- 🛠️ **Code Formatting**: Automatically formats code responses for WhatsApp display
+- **WhatsApp via Twilio**: inbound webhook (`POST /webhook`) + outbound replies via Twilio REST.
+- **Immediate ack + background processing**: avoids webhook timeout limits; real reply is sent later.
+- **Images + text**: receives WhatsApp media (`MediaUrl0..`) and sends multimodal input to Gemini.
+- **Gemini tool-calling**: uses MCP tool declarations + `function_response` protocol for reliable tool execution.
+- **Redis sessions + idempotency**: per-user chat history in Redis, plus MessageSid dedupe to avoid double-processing.
+- **Job queue (optional)**: Redis + RQ worker for scalable background processing; fallback to threads when disabled.
+- **REST API**: test the assistant without Twilio (`POST /api/chat`).
 
 ## Quick Start
 
 ### Prerequisites
 
-- Python 3.8+
+- Python 3.10+
 - Twilio account with WhatsApp sandbox
 - Google Gemini API key
-- (Optional) GitHub personal access token
-- (Optional) Redis (recommended for scalability)
+- (Optional) GitHub token (for GitHub MCP tools)
+- (Optional) Netlify token (for Netlify MCP tools)
+- (Recommended) Redis (for durable sessions + queue)
+- Node.js / npm (only needed when running MCP locally without Docker; Docker image already includes it)
 
 ### Installation
 
@@ -41,18 +44,25 @@ A simple WhatsApp bot powered by Google Gemini AI that helps users build apps an
    cp .env.example .env
    ```
    
-   Edit `.env` with your values:
+   Edit `.env` with your values (names match the current code):
    ```env
    GEMINI_API_KEY=your_gemini_api_key_here
    TWILIO_ACCOUNT_SID=your_twilio_account_sid
    TWILIO_AUTH_TOKEN=your_twilio_auth_token
-   TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+   TWILIO_PHONE_NUMBER=whatsapp:+14155238886
    SECRET_KEY=your_secret_key_here
    ```
 
 4. **Run the application**
+
+   Dev server:
    ```bash
-   python app.py
+   python run.py
+   ```
+
+   Production-style server on Windows:
+   ```bash
+   python serve_waitress.py
    ```
 
 ## Docker (recommended on Windows)
@@ -86,7 +96,7 @@ docker compose up --build
 ### Notes
 
 - First run can take a few minutes while `npx` downloads MCP packages.
-- For local dev without RQ, set `USE_RQ=0` to use threads.
+- For local dev without the queue, set `USE_RQ=0` to use threads (still supports Redis sessions).
 
 ## Usage
 
@@ -104,15 +114,13 @@ docker compose up --build
    - Send messages to your Twilio WhatsApp number
    - The AI will respond with coding help and guidance
 
-### GitHub Token (Optional)
+### GitHub / Netlify tools (optional)
 
-To enable enhanced GitHub project guidance, send your personal access token:
+MCP tools are enabled via environment variables:
+- `GITHUB_TOKEN` enables GitHub MCP tools
+- `NETLIFY_API_KEY` enables Netlify MCP tools
 
-```
-TOKEN: your_github_personal_access_token_here
-```
-
-The AI will then provide more specific guidance for repository structure, code organization, and best practices.
+Tokens are **not** read from WhatsApp messages.
 
 ### API Testing
 
@@ -140,15 +148,26 @@ curl -X POST http://localhost:5000/api/chat \
 
 ```
 waWeb/
-├── app.py                 # Main Flask application
+├── app.py                 # Flask app + Twilio webhook + API endpoints
+├── run.py                 # Dev runner
+├── serve_waitress.py      # Production-style runner (Windows/cross-platform)
+├── run_worker.py          # RQ worker runner (Linux/WSL/Docker)
 ├── requirements.txt       # Python dependencies
-├── .env.example          # Environment variables template
+├── docker-compose.yml     # web + worker + redis
+├── Dockerfile
+├── .env.example           # Environment variables template
 ├── services/
-│   ├── ai_service.py     # Google Gemini AI integration
-│   └── twilio_service.py # Twilio WhatsApp integration
+│   ├── ai_service.py       # Google Gemini integration (multimodal + tool loop)
+│   ├── twilio_service.py   # Twilio TwiML + REST send + media download
+│   ├── mcp_manager.py      # Persistent MCP sessions (stdio + tool cache)
+│   ├── session_store.py    # Redis/memory sessions + Twilio idempotency
+│   └── queue_service.py    # RQ enqueue helper (auto-disabled on Windows)
+├── jobs/
+│   └── whatsapp_job.py     # Background job implementation
 ├── utils/
-│   ├── logger.py         # Logging configuration
-│   └── code_formatter.py # Code formatting utilities
+│   ├── logger.py           # Logging
+│   ├── code_formatter.py   # WhatsApp-friendly formatting + truncation
+│   └── chat_history.py     # Shared history helpers (image trimming)
 └── logs/                 # Application logs
 ```
 
@@ -161,8 +180,13 @@ waWeb/
 | `GEMINI_API_KEY` | Google Gemini API key | Yes |
 | `TWILIO_ACCOUNT_SID` | Twilio Account SID | Yes |
 | `TWILIO_AUTH_TOKEN` | Twilio Auth Token | Yes |
-| `TWILIO_WHATSAPP_FROM` | Twilio WhatsApp number | Yes |
+| `TWILIO_PHONE_NUMBER` | Twilio WhatsApp number (e.g. `whatsapp:+14155238886`) | Yes |
 | `SECRET_KEY` | Flask secret key | No (auto-generated) |
+| `REDIS_URL` | Redis URL for sessions + idempotency + RQ | Recommended |
+| `USE_RQ` | Enable RQ background jobs (requires Redis; auto-disabled on Windows) | No |
+| `MCP_START_TIMEOUT` | Seconds to wait for MCP servers to start and cache tools | No |
+| `GITHUB_TOKEN` | GitHub token for GitHub MCP tools | Optional |
+| `NETLIFY_API_KEY` | Netlify token for Netlify MCP tools | Optional |
 
 ### Getting API Keys
 
@@ -181,27 +205,23 @@ waWeb/
 
 ### Local Development
 ```bash
-python app.py
+python run.py
 ```
 
 ### Production Deployment
 
-1. **Using Gunicorn**
-   ```bash
-   pip install gunicorn
-   gunicorn -w 4 -b 0.0.0.0:5000 app:app
-   ```
+#### Docker Compose (recommended)
+```bash
+docker compose up --build
+```
 
-2. **Using Docker** (optional)
-   ```dockerfile
-   FROM python:3.9-slim
-   WORKDIR /app
-   COPY requirements.txt .
-   RUN pip install -r requirements.txt
-   COPY . .
-   EXPOSE 5000
-   CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "app:app"]
-   ```
+#### Linux/macOS (Gunicorn)
+Gunicorn is Unix-only. Use `gunicorn -c gunicorn.conf.py app:app`.
+
+#### Windows (Waitress)
+```bash
+python serve_waitress.py
+```
 
 ## Contributing
 
@@ -241,3 +261,7 @@ If you encounter any issues or have questions:
 4. **"Internal server error"**
    - Check the application logs in the `logs/` directory
    - Verify all required environment variables are set 
+
+5. **Docker starts but MCP tools are missing**
+   - First boot may take time while `npx` downloads MCP packages; wait and retry.
+   - Increase `MCP_START_TIMEOUT` (e.g. `600`) if needed.
