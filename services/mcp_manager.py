@@ -7,6 +7,11 @@ from mcp.client.stdio import stdio_client
 from utils.logger import logger
 
 
+def _npx_command() -> str:
+    """Windows uses npx.cmd; Linux/macOS/WSL use npx."""
+    return "npx.cmd" if os.name == "nt" else "npx"
+
+
 class MCPManager:
     """
     Runs MCP stdio transports on ONE dedicated asyncio event loop (background thread).
@@ -87,8 +92,10 @@ class MCPManager:
                 filtered[key] = value
         return filtered
 
-    def start(self, timeout=120):
+    def start(self, timeout: int | None = None):
         """Start background loop and persistent MCP sessions. Blocks until ready or timeout."""
+        if timeout is None:
+            timeout = int(os.environ.get("MCP_START_TIMEOUT", "300"))
         if self._thread and self._thread.is_alive():
             return
         self._shutdown.clear()
@@ -96,7 +103,11 @@ class MCPManager:
         self._thread = threading.Thread(target=self._thread_main, name="mcp-loop", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=timeout):
-            raise RuntimeError("MCPManager failed to start within timeout")
+            raise RuntimeError(
+                f"MCPManager failed to start within {timeout}s "
+                f"(first npx -y downloads can be slow on WSL or /mnt/c/; "
+                f"raise MCP_START_TIMEOUT or run the project from ~/ on ext4)"
+            )
 
     def stop(self):
         """Request shutdown (best-effort)."""
@@ -134,13 +145,21 @@ class MCPManager:
     async def _startup_async(self):
         logger.info("MCP background loop: connecting persistent stdio sessions...")
         try:
+            tasks = []
             if self.github_token:
-                await self._connect_github()
+                tasks.append(self._connect_github())
             if self.netlify_token:
-                await self._connect_netlify()
+                tasks.append(self._connect_netlify())
             if self.pinecone_api_key:
-                await self._connect_pinecone()
+                tasks.append(self._connect_pinecone())
+            if tasks:
+                logger.info(
+                    "MCP: starting %s stdio server(s) in parallel (npx may download packages)...",
+                    len(tasks),
+                )
+                await asyncio.gather(*tasks)
             await self._refresh_tool_cache()
+            logger.info("MCP: tool cache ready")
         except Exception as e:
             logger.error(f"MCP startup error: {str(e)}")
 
@@ -148,7 +167,7 @@ class MCPManager:
         if self._github_session:
             return
         params = StdioServerParameters(
-            command="npx.cmd",
+            command=_npx_command(),
             args=["-y", "@modelcontextprotocol/server-github"],
             env={"GITHUB_PERSONAL_ACCESS_TOKEN": self.github_token},
         )
@@ -163,7 +182,7 @@ class MCPManager:
         if self._netlify_session:
             return
         params = StdioServerParameters(
-            command="npx.cmd",
+            command=_npx_command(),
             args=["-y", "@netlify/mcp"],
             env={"NETLIFY_API_KEY": self.netlify_token},
         )
@@ -177,9 +196,8 @@ class MCPManager:
     async def _connect_pinecone(self):
         if self._pinecone_session:
             return
-        npx = "npx.cmd" if os.name == "nt" else "npx"
         params = StdioServerParameters(
-            command=npx,
+            command=_npx_command(),
             args=["-y", "@pinecone-database/mcp"],
             env={"PINECONE_API_KEY": self.pinecone_api_key},
         )
